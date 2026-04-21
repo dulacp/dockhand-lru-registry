@@ -77,4 +77,4 @@ jobs:
           build-args: |
             VERSION=${{ env.CI_VERSION }}
           tags: |
-            ghcr.io/boxboat/dockhand-lru-registry:${{ env.CI_VERSION }}
+            ghcr.io/${{ github.repository }}:${{ env.CI_VERSION }}
