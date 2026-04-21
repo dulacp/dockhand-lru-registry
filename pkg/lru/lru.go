@@ -87,14 +87,14 @@ func (cache *Cache) getAccessTime(image *Image) *time.Time {
 func (cache *Cache) updateAccessTime(image *Image, oldAccessTime *time.Time) error {
 	_ = cache.Db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(AccessBucket)
-		if err := b.Delete([]byte(oldAccessTime.Format(time.RFC3339))); err != nil {
+		if err := b.Delete([]byte(oldAccessTime.Format(time.RFC3339Nano))); err != nil {
 			return err
 		}
-		if err := b.Put([]byte(image.AccessTime.Format(time.RFC3339)), []byte(image.Name())); err != nil {
+		if err := b.Put([]byte(image.AccessTime.Format(time.RFC3339Nano)), []byte(image.Name())); err != nil {
 			return err
 		}
 		b = tx.Bucket(ImageBucket)
-		if err := b.Put([]byte(image.Name()), []byte(image.AccessTime.Format(time.RFC3339))); err != nil {
+		if err := b.Put([]byte(image.Name()), []byte(image.AccessTime.Format(time.RFC3339Nano))); err != nil {
 			return err
 		}
 		return nil
@@ -105,11 +105,11 @@ func (cache *Cache) updateAccessTime(image *Image, oldAccessTime *time.Time) err
 func (cache *Cache) addImage(image *Image) error {
 	_ = cache.Db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(AccessBucket)
-		if err := b.Put([]byte(image.AccessTime.Format(time.RFC3339)), []byte(image.Name())); err != nil {
+		if err := b.Put([]byte(image.AccessTime.Format(time.RFC3339Nano)), []byte(image.Name())); err != nil {
 			return err
 		}
 		b = tx.Bucket(ImageBucket)
-		if err := b.Put([]byte(image.Name()), []byte(image.AccessTime.Format(time.RFC3339))); err != nil {
+		if err := b.Put([]byte(image.Name()), []byte(image.AccessTime.Format(time.RFC3339Nano))); err != nil {
 			return err
 		}
 		return nil
@@ -120,7 +120,7 @@ func (cache *Cache) addImage(image *Image) error {
 func (cache *Cache) AddOrUpdate(image *Image) {
 	lastAccessTime := cache.getAccessTime(image)
 	if lastAccessTime != nil && !lastAccessTime.Equal(image.AccessTime) {
-		common.Log.Debugf("updating access time: %s", image.AccessTime.Format(time.RFC3339))
+		common.Log.Debugf("updating access time: %s", image.AccessTime.Format(time.RFC3339Nano))
 		cache.updateAccessTime(image, lastAccessTime)
 	} else {
 		cache.addImage(image)
@@ -130,7 +130,7 @@ func (cache *Cache) AddOrUpdate(image *Image) {
 func (cache *Cache) Remove(image *Image) {
 	_ = cache.Db.Update(func(tx *bolt.Tx) error {
 		b := tx.Bucket(AccessBucket)
-		if err := b.Delete([]byte(image.AccessTime.Format(time.RFC3339))); err != nil {
+		if err := b.Delete([]byte(image.AccessTime.Format(time.RFC3339Nano))); err != nil {
 			common.LogIfError(err)
 			return err
 		}
