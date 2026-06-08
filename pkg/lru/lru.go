@@ -17,16 +17,27 @@ limitations under the License.
 package lru
 
 import (
+	"errors"
 	"fmt"
-	"github.com/boxboat/dockhand-lru-registry/pkg/common"
-	bolt "go.etcd.io/bbolt"
+	"sort"
 	"strings"
 	"time"
+
+	"github.com/boxboat/dockhand-lru-registry/pkg/common"
+	bolt "go.etcd.io/bbolt"
 )
 
 var (
-	ImageBucket  = []byte("images")
-	AccessBucket = []byte("access")
+	// ImageBucket maps image name ("repo:tag") -> last access time. It is the
+	// single source of truth for what the cleanup loop may evict.
+	ImageBucket = []byte("images")
+
+	// legacyAccessBucket was a secondary time->name index used to iterate tags
+	// in LRU order. It was lossy (two tags formatting to the same timestamp key
+	// overwrote each other) and silently desynced from ImageBucket, hiding the
+	// vast majority of tracked tags from eviction. It is no longer written and
+	// is dropped from existing databases on Init.
+	legacyAccessBucket = []byte("access")
 )
 
 type Cache struct {
@@ -51,92 +62,29 @@ func (image *Image) CanonicalName(registryAddress string) string {
 }
 
 func (cache *Cache) Init() error {
-	if err := cache.Db.Update(cache.createBucket(ImageBucket)); err != nil {
-		return err
-	}
-	if err := cache.Db.Update(cache.createBucket(AccessBucket)); err != nil {
-		return err
-	}
-	return nil
-}
-
-func (cache *Cache) createBucket(bucket []byte) func(tx *bolt.Tx) error {
-	return func(tx *bolt.Tx) error {
-		if _, err := tx.CreateBucketIfNotExists(bucket); err != nil {
+	return cache.Db.Update(func(tx *bolt.Tx) error {
+		if _, err := tx.CreateBucketIfNotExists(ImageBucket); err != nil {
 			return fmt.Errorf("create bucket: %v", err)
 		}
-		return nil
-	}
-}
-
-func (cache *Cache) getAccessTime(image *Image) *time.Time {
-	accessTime := &time.Time{}
-	_ = cache.Db.View(func(tx *bolt.Tx) error {
-		b := tx.Bucket(ImageBucket)
-		if v := b.Get([]byte(image.Name())); v != nil {
-			if err := accessTime.UnmarshalText(v); err != nil {
-				common.LogIfError(err)
-				return err
-			}
+		if err := tx.DeleteBucket(legacyAccessBucket); err != nil && !errors.Is(err, bolt.ErrBucketNotFound) {
+			return fmt.Errorf("drop legacy access bucket: %v", err)
 		}
 		return nil
 	})
-	return accessTime
-}
-
-func (cache *Cache) updateAccessTime(image *Image, oldAccessTime *time.Time) error {
-	_ = cache.Db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(AccessBucket)
-		if err := b.Delete([]byte(oldAccessTime.Format(time.RFC3339Nano))); err != nil {
-			return err
-		}
-		if err := b.Put([]byte(image.AccessTime.Format(time.RFC3339Nano)), []byte(image.Name())); err != nil {
-			return err
-		}
-		b = tx.Bucket(ImageBucket)
-		if err := b.Put([]byte(image.Name()), []byte(image.AccessTime.Format(time.RFC3339Nano))); err != nil {
-			return err
-		}
-		return nil
-	})
-	return nil
-}
-
-func (cache *Cache) addImage(image *Image) error {
-	_ = cache.Db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(AccessBucket)
-		if err := b.Put([]byte(image.AccessTime.Format(time.RFC3339Nano)), []byte(image.Name())); err != nil {
-			return err
-		}
-		b = tx.Bucket(ImageBucket)
-		if err := b.Put([]byte(image.Name()), []byte(image.AccessTime.Format(time.RFC3339Nano))); err != nil {
-			return err
-		}
-		return nil
-	})
-	return nil
 }
 
 func (cache *Cache) AddOrUpdate(image *Image) {
-	lastAccessTime := cache.getAccessTime(image)
-	if lastAccessTime != nil && !lastAccessTime.Equal(image.AccessTime) {
-		common.Log.Debugf("updating access time: %s", image.AccessTime.Format(time.RFC3339Nano))
-		cache.updateAccessTime(image, lastAccessTime)
-	} else {
-		cache.addImage(image)
-	}
+	_ = cache.Db.Update(func(tx *bolt.Tx) error {
+		return tx.Bucket(ImageBucket).Put(
+			[]byte(image.Name()),
+			[]byte(image.AccessTime.Format(time.RFC3339Nano)),
+		)
+	})
 }
 
 func (cache *Cache) Remove(image *Image) {
 	_ = cache.Db.Update(func(tx *bolt.Tx) error {
-		b := tx.Bucket(AccessBucket)
-		if err := b.Delete([]byte(image.AccessTime.Format(time.RFC3339Nano))); err != nil {
-			common.LogIfError(err)
-			return err
-		}
-
-		b = tx.Bucket(ImageBucket)
-		if err := b.Delete([]byte(image.Name())); err != nil {
+		if err := tx.Bucket(ImageBucket).Delete([]byte(image.Name())); err != nil {
 			common.LogIfError(err)
 			return err
 		}
@@ -144,21 +92,35 @@ func (cache *Cache) Remove(image *Image) {
 	})
 }
 
+// GetLruList returns every tracked image ordered least-recently-used first.
+// It reads ImageBucket directly and sorts by access time, so the result always
+// reflects the full tracked set regardless of timestamp collisions — the bug
+// that the removed time-keyed access index suffered from.
 func (cache *Cache) GetLruList() []Image {
 	var images []Image
-	cache.Db.View(func(tx *bolt.Tx) error {
-		c := tx.Bucket(AccessBucket).Cursor()
-
-		for k, v := c.First(); k != nil; k, v = c.Next() {
-			access := time.Time{}
-			_ = access.UnmarshalText(k)
+	_ = cache.Db.View(func(tx *bolt.Tx) error {
+		return tx.Bucket(ImageBucket).ForEach(func(k, v []byte) error {
+			accessTime := time.Time{}
+			if err := accessTime.UnmarshalText(v); err != nil {
+				common.LogIfError(err)
+				return nil
+			}
+			name := string(k)
+			sep := strings.LastIndex(name, ":")
+			if sep < 0 {
+				common.Log.Warnf("skipping malformed image key without tag separator: %s", name)
+				return nil
+			}
 			images = append(images, Image{
-				Repo:       strings.Split(string(v), ":")[0],
-				Tag:        strings.Split(string(v), ":")[1],
-				AccessTime: access,
+				Repo:       name[:sep],
+				Tag:        name[sep+1:],
+				AccessTime: accessTime,
 			})
-		}
-		return nil
+			return nil
+		})
+	})
+	sort.Slice(images, func(i, j int) bool {
+		return images[i].AccessTime.Before(images[j].AccessTime)
 	})
 	return images
 }
