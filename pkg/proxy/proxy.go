@@ -103,11 +103,20 @@ func (proxy *Proxy) serveProxy(res http.ResponseWriter, req *http.Request) {
 				common.Log.Infof(`pushing %s`, image)
 			}
 
-			proxy.Cache.AddOrUpdate(&lru.Image{
-				Repo:       repo,
-				Tag:        tag,
-				AccessTime: time.Now(),
-			})
+			// By-digest manifest accesses (e.g. BuildKit cache-export children
+			// referenced as "…/manifests/sha256:…") are not tags: they cannot
+			// be evicted via TagDelete and the registry's GC reclaims them once
+			// their tagged parents are gone. Tracking them as pseudo-tags
+			// poisoned the LRU cache and stalled the cleanup loop.
+			if lru.IsDigestReference(tag) {
+				common.Log.Debugf("not tracking by-digest manifest reference %s", image)
+			} else {
+				proxy.Cache.AddOrUpdate(&lru.Image{
+					Repo:       repo,
+					Tag:        tag,
+					AccessTime: time.Now(),
+				})
+			}
 		}
 	}
 
@@ -162,22 +171,33 @@ func (proxy *Proxy) cleanup(ctx context.Context) {
 		removalTags := int(math.Max(percentageTagRemoval, minTagRemoval))
 		common.Log.Infof("iteration %d: removing %d tags", iteration, removalTags)
 
+		removed := 0
 		for idx, image := range lruImages {
 			if idx < removalTags {
 				if ref, err := ref.New(image.CanonicalName(proxy.RegistryHost)); err == nil {
 					common.Log.Infof("Removing %s", ref.CommonName())
 					if err = proxy.RegClient.TagDelete(ctx, ref); err == nil {
 						proxy.Cache.Remove(&image)
+						removed++
 					} else if errors.Is(err, types.ErrNotFound) {
 						proxy.Cache.Remove(&image)
+						removed++
 					} else {
 						common.LogIfError(err)
 						if _, err := proxy.RegClient.ManifestGet(ctx, ref); err != nil && errors.Is(err, types.ErrNotFound) {
 							proxy.Cache.Remove(&image)
+							removed++
 						}
 					}
 				} else {
+					// The entry cannot be parsed into a deletable reference
+					// (e.g. a digest-keyed pseudo-tag from an older version).
+					// Drop it from the cache — leaving it in place makes the
+					// LRU list immutable and spins this loop forever.
 					common.LogIfError(err)
+					common.Log.Warnf("dropping unevictable cache entry %s", image.Name())
+					proxy.Cache.Remove(&image)
+					removed++
 				}
 			} else {
 				break
@@ -185,7 +205,14 @@ func (proxy *Proxy) cleanup(ctx context.Context) {
 		}
 		proxy.runGarbageCollection(ctx)
 		tryAgain, currentBytes := proxy.shouldRemoveTags()
-		if tryAgain && (len(lruImages)-removalTags) <= 0 {
+		if tryAgain && removed == 0 {
+			// Defensive guard: an iteration that changed nothing would loop
+			// forever while holding the maintenance semaphore (starving
+			// writes with 503s). Bail out and let the next scheduled run
+			// retry from a clean slate.
+			remove = false
+			common.Log.Warnf("cleanup iteration %d made no progress - exiting cleanup with %d bytes (target %d)", iteration, currentBytes, proxy.CleanSettings.TargetUsageBytes)
+		} else if tryAgain && (len(lruImages)-removalTags) <= 0 {
 			// we have reached a state where we can't remove anymore tags
 			remove = false
 			common.Log.Warnf("unable to reach regisry target %d bytes  - exiting cleanup with %d bytes", proxy.CleanSettings.TargetUsageBytes, currentBytes)

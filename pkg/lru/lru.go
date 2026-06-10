@@ -53,6 +53,16 @@ type Image struct {
 func (image *Image) Name() string {
 	return fmt.Sprintf("%s:%s", image.Repo, image.Tag)
 }
+
+// IsDigestReference reports whether a manifest reference is a content digest
+// (e.g. "sha256:77bcab40…") rather than a tag. Tags cannot contain ':' per the
+// distribution spec, so any reference containing one is a digest. BuildKit
+// cache exports pull/push child manifests by digest; those are not evictable
+// tags — regclient.TagDelete rejects them as invalid references — so they must
+// never enter the LRU cache (see Init for the purge of historic entries).
+func IsDigestReference(reference string) bool {
+	return strings.Contains(reference, ":")
+}
 func (image *Image) CanonicalName(registryAddress string) string {
 	if strings.HasPrefix(registryAddress, "http") {
 		registryAddress = strings.Split(registryAddress, "://")[1]
@@ -69,11 +79,39 @@ func (cache *Cache) Init() error {
 		if err := tx.DeleteBucket(legacyAccessBucket); err != nil && !errors.Is(err, bolt.ErrBucketNotFound) {
 			return fmt.Errorf("drop legacy access bucket: %v", err)
 		}
+		// One-time purge of digest-keyed entries ("repo:sha256:…") recorded by
+		// older versions that tracked by-digest manifest accesses as if they
+		// were tags. They cannot be evicted via TagDelete (invalid reference),
+		// which jammed the cleanup loop into an infinite zero-progress spin.
+		// The registry's own `garbage-collect --delete-untagged` reclaims the
+		// underlying manifests once their tagged parents are evicted.
+		purged := 0
+		cursor := tx.Bucket(ImageBucket).Cursor()
+		for k, _ := cursor.First(); k != nil; k, _ = cursor.Next() {
+			name := string(k)
+			if sep := strings.Index(name, ":"); sep >= 0 && IsDigestReference(name[sep+1:]) {
+				if err := cursor.Delete(); err != nil {
+					return fmt.Errorf("purge digest-keyed entry %s: %v", name, err)
+				}
+				purged++
+			}
+		}
+		if purged > 0 {
+			common.Log.Infof("purged %d digest-keyed entries from the image cache", purged)
+		}
 		return nil
 	})
 }
 
 func (cache *Cache) AddOrUpdate(image *Image) {
+	// Enforce the cache invariant at the boundary: every stored entry must be
+	// evictable (CanonicalName must parse into a TagDelete-able reference).
+	// A digest pseudo-tag would be immortal — TagDelete rejects it, so the
+	// cleanup loop could never shrink the LRU list (infinite spin).
+	if IsDigestReference(image.Tag) {
+		common.Log.Debugf("not tracking by-digest manifest reference %s", image.Name())
+		return
+	}
 	_ = cache.Db.Update(func(tx *bolt.Tx) error {
 		return tx.Bucket(ImageBucket).Put(
 			[]byte(image.Name()),
@@ -106,7 +144,11 @@ func (cache *Cache) GetLruList() []Image {
 				return nil
 			}
 			name := string(k)
-			sep := strings.LastIndex(name, ":")
+			// Split on the first ':' — repo names cannot contain one, so this
+			// is always the repo/tag separator. (LastIndex mis-parsed any
+			// digest-keyed stragglers, e.g. "repo:sha256:…" became repo
+			// "repo:sha256".)
+			sep := strings.Index(name, ":")
 			if sep < 0 {
 				common.Log.Warnf("skipping malformed image key without tag separator: %s", name)
 				return nil

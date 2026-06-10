@@ -121,6 +121,83 @@ func TestRemove_DropsOnlyTheNamedImage(t *testing.T) {
 	}
 }
 
+// TestIsDigestReference distinguishes evictable tags from by-digest manifest
+// references (which TagDelete rejects and must therefore never be tracked).
+func TestIsDigestReference(t *testing.T) {
+	cases := []struct {
+		reference string
+		want      bool
+	}{
+		{"latest", false},
+		{"6be38e95b24106f65f5163a89dbdef84cda02553", false},
+		{"v1.2.3", false},
+		{"sha256:77bcab407d0d081a16ca934cdac4bf45dab8d627c33cdd3ca21f263d5a08641f", true},
+		{"sha512:deadbeef", true},
+	}
+	for _, c := range cases {
+		if got := IsDigestReference(c.reference); got != c.want {
+			t.Errorf("IsDigestReference(%q) = %v, want %v", c.reference, got, c.want)
+		}
+	}
+}
+
+// TestInit_PurgesDigestKeyedEntries is the regression for the eviction-loop
+// stall: databases written by older versions contain "repo:sha256:…" pseudo-tag
+// entries (BuildKit by-digest manifest accesses). They cannot be deleted via
+// TagDelete, so if they survive Init the cleanup loop can never shrink the LRU
+// list and spins forever. Init must drop them while real tags survive.
+func TestInit_PurgesDigestKeyedEntries(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "usage.db")
+	db, err := bolt.Open(path, 0600, nil)
+	if err != nil {
+		t.Fatalf("bolt.Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	// Seed a DB shaped like production: real tags mixed with digest pseudo-tags.
+	err = db.Update(func(tx *bolt.Tx) error {
+		images, err := tx.CreateBucketIfNotExists(ImageBucket)
+		if err != nil {
+			return err
+		}
+		now := []byte(time.Now().Format(time.RFC3339Nano))
+		seed := []string{
+			"cache/codex-app-api-arm64:latest",
+			"cache/codex-app-api-arm64:6be38e95b24106f65f5163a89dbdef84cda02553",
+			"24243490396-7/test-stack-auth:sha256:77bcab407d0d081a16ca934cdac4bf45dab8d627c33cdd3ca21f263d5a08641f",
+			"24243490396-7/test-stack-minio:sha256:39f1873051e24bbc150fa8185a3eb478ff1d03592f2ae75a2f9b9f2d955f9eff",
+		}
+		for _, key := range seed {
+			if err := images.Put([]byte(key), now); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("seed db: %v", err)
+	}
+
+	cache := &Cache{Db: db}
+	if err := cache.Init(); err != nil {
+		t.Fatalf("cache.Init: %v", err)
+	}
+
+	got := cache.GetLruList()
+	if len(got) != 2 {
+		t.Fatalf("Init must purge digest-keyed entries and keep real tags: got %d entries %+v, want 2", len(got), got)
+	}
+	for _, image := range got {
+		if image.Repo != "cache/codex-app-api-arm64" {
+			t.Errorf("unexpected survivor %q — digest pseudo-tags must be purged", image.Name())
+		}
+		if IsDigestReference(image.Tag) {
+			t.Errorf("survivor %q still has a digest tag component", image.Name())
+		}
+	}
+}
+
 // TestInit_DropsLegacyAccessBucket verifies the one-time migration: an existing
 // database carrying the removed "access" index has it deleted on Init, while the
 // authoritative images survive.
